@@ -12,7 +12,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 # Third Party
 import torch
@@ -67,10 +67,25 @@ class ParallelMPPIConfig(ParticleOptConfig):
     gamma: float
     kappa: float
     sample_per_problem: bool
+    hierarchy_cfg: Optional[Dict[str, Any]] = None  # NEW added: 계층형 임피던스 제어 구성을 보관. (한국어 주석)
 
     def __post_init__(self):
         self.init_cov = self.tensor_args.to_device(self.init_cov).unsqueeze(0)
         self.init_mean = self.tensor_args.to_device(self.init_mean).clone()
+        if self.hierarchy_cfg is not None and "feasibility_thresholds" in self.hierarchy_cfg:
+            thresholds = self.hierarchy_cfg["feasibility_thresholds"]
+            if isinstance(thresholds, dict):
+                # NEW added: 설정 파일의 수치들을 부동소수로 강제 변환해 사용 편의를 높임. (한국어 주석)
+                self.hierarchy_cfg["feasibility_thresholds"] = {
+                    k: float(v) for k, v in thresholds.items()
+                }
+        if self.hierarchy_cfg is not None and "task_weights" in self.hierarchy_cfg:
+            weights = self.hierarchy_cfg["task_weights"]
+            if isinstance(weights, dict):
+                # NEW added: 작업 가중치도 float으로 변환해 연산 안정성을 확보. (한국어 주석)
+                self.hierarchy_cfg["task_weights"] = {
+                    k: float(v) for k, v in weights.items()
+                }
         return super().__post_init__()
 
     @staticmethod
@@ -160,6 +175,19 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
         self.info = dict(rollout_time=0.0, entropy=[])
         self._batch_size = -1
         self._store_debug = False
+        self.hierarchy_cfg = self.hierarchy_cfg or {}  # NEW added: 계층 구성 미지정 시 빈 dict로 초기화. (한국어 주석)
+        # NEW added: 계층형 비용 가중치 구성을 읽어 MPPI에 적용하기 위한 내부 변수 초기화. (한국어 주석)
+        self._hierarchy_order: List[str] = self.hierarchy_cfg.get("task_order", [])
+        self._hierarchy_thresholds: Dict[str, float] = self.hierarchy_cfg.get(
+            "feasibility_thresholds", {}
+        )
+        self._hierarchy_weights: Dict[str, float] = self.hierarchy_cfg.get("task_weights", {})
+        self._hierarchy_penalty: float = float(
+            self.hierarchy_cfg.get("violation_penalty", 1e4)
+        )
+        self._nullspace_damping: float = float(
+            self.hierarchy_cfg.get("nullspace_damping", 0.0)
+        )
 
     def get_rollouts(self):
         return self.top_trajs
@@ -172,14 +200,15 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
         self.reset_mean()
         self.reset_covariance()
 
-    def _compute_total_cost(self, costs):
+    def _compute_total_cost(self, costs, task_costs=None, task_labels=None):
         """
         Calculate weights using exponential utility
         """
 
-        # cost_seq = self.gamma_seq * costs
-        # cost_seq = torch.sum(cost_seq, dim=-1, keepdim=False) / self.gamma_seq[..., 0]
-        # print(self.gamma_seq.shape, costs.shape)
+        if task_costs is not None and len(self._hierarchy_order) > 0:
+            combined = self._combine_task_costs(task_costs, task_labels)  # NEW added: 계층 가중 비용을 반영. (한국어 주석)
+            if combined is not None:
+                costs = combined
         cost_seq = jit_compute_total_cost(self.gamma_seq, costs)
         return cost_seq
 
@@ -221,9 +250,57 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
             w = w.unsqueeze(-1).unsqueeze(-1)
             new_mean = self._compute_mean(w, actions)
             new_cov = self._compute_covariance(w, actions)
-            self._update_cov_scale(new_cov)
+        self._update_cov_scale(new_cov)
 
         return new_mean, new_cov
+
+    def _combine_task_costs(self, task_costs: torch.Tensor, task_labels: Optional[Sequence[str]]):
+        # NEW added: 계층형 우선순위를 고려해 샘플 비용을 재조합하는 전처리 단계. (한국어 주석)
+        if task_costs is None or task_costs.numel() == 0:
+            return None
+        if len(self._hierarchy_order) == 0:
+            return None
+        if task_labels is None:
+            task_labels = self._hierarchy_order
+
+        label_to_index = {label: idx for idx, label in enumerate(task_labels)}  # NEW added: 작업 레이블-인덱스 맵 구성. (한국어 주석)
+        ordered_indices = [label_to_index.get(label) for label in self._hierarchy_order]
+        ordered_indices = [idx for idx in ordered_indices if idx is not None]
+        if len(ordered_indices) == 0:
+            return None
+
+        horizon = task_costs.shape[-1]
+        num_tasks = task_costs.shape[-2]
+        particles_per_problem = self.total_num_particles // self.n_problems
+        reshaped = task_costs.view(self.n_problems, particles_per_problem, num_tasks, horizon)  # NEW added: 문제-입자-작업 구조로 재배열. (한국어 주석)
+        combined = torch.zeros(  # NEW added: 우선순위 누적 비용을 저장할 텐서 초기화. (한국어 주석)
+            self.n_problems,
+            particles_per_problem,
+            horizon,
+            device=task_costs.device,
+            dtype=task_costs.dtype,
+        )
+        mask = torch.ones_like(combined, dtype=torch.bool)  # NEW added: 우선순위 위반을 누적 마스킹. (한국어 주석)
+
+        for label in self._hierarchy_order:
+            idx = label_to_index.get(label)
+            if idx is None:
+                continue
+            # NEW added: 각 작업의 가중치를 적용하고 허용 임계값을 넘으면 마스킹 처리. (한국어 주석)
+            component = reshaped[:, :, idx, :]
+            weight = self._hierarchy_weights.get(label, 1.0)
+            component_weighted = weight * component * mask.to(component.dtype)  # NEW added: 우선순위 가중치를 적용한 비용. (한국어 주석)
+            combined = combined + component_weighted  # NEW added: 누적 비용에 합산. (한국어 주석)
+            threshold = self._hierarchy_thresholds.get(label)
+            if threshold is not None:
+                threshold_tensor = component.new_tensor(threshold)
+                violation = component > threshold_tensor  # NEW added: 임계값 초과 여부 계산. (한국어 주석)
+                excess = torch.where(violation, component - threshold_tensor, component.new_zeros(1))  # NEW added: 초과분 추정. (한국어 주석)
+                combined = combined + self._hierarchy_penalty * excess  # NEW added: 페널티를 누적. (한국어 주석)
+                mask = mask & (~violation)  # NEW added: 위반된 샘플은 이후 작업에서 제외. (한국어 주석)
+
+        combined = combined.view(self.n_problems * particles_per_problem, horizon)  # NEW added: 원래 MPPI 형상으로 복원. (한국어 주석)
+        return combined
 
     def _compute_covariance(self, w, actions):
         if not self.update_cov:
@@ -284,6 +361,17 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
     def _update_distribution(self, trajectories: Trajectory):
         costs = trajectories.costs
         actions = trajectories.actions
+        task_costs = getattr(trajectories, "task_costs", None)
+        task_labels = getattr(trajectories, "task_labels", None)
+        merged_costs = None
+        if task_costs is not None and len(self._hierarchy_order) > 0:
+            combined = self._combine_task_costs(task_costs, task_labels)
+            if combined is not None:
+                if costs.dim() == 3:
+                    merged_costs = combined.view_as(costs)
+                else:
+                    merged_costs = combined
+        costs_for_weights = merged_costs if merged_costs is not None else costs
 
         # Let's reshape to n_problems now:
 
@@ -293,13 +381,13 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
 
             # Update best action
             if self.sample_mode == SampleMode.BEST:
-                w = self._exp_util_from_costs(costs)
+                w = self._exp_util_from_costs(costs_for_weights)
                 best_idx = torch.argmax(w, dim=-1)
                 self.best_traj.copy_(actions[self.problem_col, best_idx])
         with profiler.record_function("mppi/store_rollouts"):
 
             if self.store_rollouts and self.visual_traj is not None:
-                total_costs = self._compute_total_cost(costs)
+                total_costs = self._compute_total_cost(costs, task_costs, task_labels)
                 vis_seq = getattr(trajectories.state, self.visual_traj)
                 top_values, top_idx = torch.topk(total_costs, 20, dim=1)
                 self.top_values = top_values
@@ -316,11 +404,11 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
                     self.top_trajs.copy_(top_trajs)
 
         if not self.update_cov:
-            w = self._exp_util_from_costs(costs)
+            w = self._exp_util_from_costs(costs_for_weights)
             w = w.unsqueeze(-1).unsqueeze(-1)
             new_mean = self._compute_mean(w, actions)
         else:
-            new_mean, new_cov = self._compute_mean_covariance(costs, actions)
+            new_mean, new_cov = self._compute_mean_covariance(costs_for_weights, actions)
             self.cov_action.copy_(new_cov)
 
         self.mean_action.copy_(new_mean)
@@ -358,6 +446,8 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
         )
         act_seq = act_seq.reshape(self.total_num_particles, self.action_horizon, self.d_action)
         act_seq = scale_ctrl(act_seq, self.action_lows, self.action_highs, squash_fn=self.squash_fn)
+        # NEW added: 임피던스 우선순위를 보존하기 위해 null-space 감쇠를 적용. (한국어 주석)
+        act_seq = self._project_nullspace_actions(act_seq)
 
         # if not copy_tensor(act_seq, self.act_seq):
         #    self.act_seq = act_seq
@@ -444,6 +534,31 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
         """
         delta = self.sample_lib.get_samples(sample_shape=shape, seed=base_seed)
         return delta
+
+    def _project_nullspace_actions(self, act_seq: torch.Tensor) -> torch.Tensor:
+        # NEW added: 접촉 시 여유 자유도를 감쇠해 임피던스 우선순위를 유지. (한국어 주석)
+        if self._nullspace_damping <= 0.0:
+            return act_seq
+        rollout = getattr(self, "rollout_fn", None)
+        if rollout is None or not hasattr(rollout, "_contact_wrench"):
+            return act_seq
+        contact_wrench = rollout._contact_wrench
+        if contact_wrench is None:
+            return act_seq
+        activation_norm = float(self.hierarchy_cfg.get("contact_activation_norm", 0.0))  # NEW added: 감쇠 활성화 기준 노름. (한국어 주석)
+        if activation_norm > 0.0:
+            wrench_norm = torch.linalg.norm(contact_wrench)
+            if wrench_norm < activation_norm:
+                return act_seq
+        bound_cost = getattr(rollout, "bound_cost", None)  # NEW added: null-space 가중치를 보유한 비용 찾기. (한국어 주석)
+        if bound_cost is None or not hasattr(bound_cost, "null_space_weight"):
+            return act_seq
+        weights = bound_cost.null_space_weight  # NEW added: null-space 스칼라를 불러와 감쇠 계산. (한국어 주석)
+        if weights is None:
+            return act_seq
+        scale = 1.0 - self._nullspace_damping * weights.view(1, 1, -1)  # NEW added: 감쇠된 스케일 팩터 계산. (한국어 주석)
+        scale = torch.clamp(scale, min=0.0)
+        return act_seq * scale  # NEW added: 감쇠된 null-space 동작을 반환. (한국어 주석)
 
     @property
     def full_scale_tril(self):

@@ -19,6 +19,10 @@ import torch.autograd.profiler as profiler
 # CuRobo
 from curobo.geom.sdf.world import WorldCollision
 from curobo.rollout.cost.cost_base import CostConfig
+from curobo.rollout.cost.admittance_cost import (  # NEW added: 임피던스 비용 모듈을 가져와 접촉 제어에 활용. (한국어 주석)
+    AdmittanceCost,
+    AdmittanceCostConfig,
+)
 from curobo.rollout.cost.dist_cost import DistCost, DistCostConfig
 from curobo.rollout.cost.pose_cost import PoseCost, PoseCostConfig, PoseCostMetric
 from curobo.rollout.cost.straight_line_cost import StraightLineCost
@@ -45,6 +49,7 @@ class ArmReacherMetrics(RolloutMetrics):
     pose_error: Optional[T_BValue_float] = None
     goalset_index: Optional[T_BValue_int] = None
     null_space_error: Optional[T_BValue_float] = None
+    admittance_error: Optional[T_BValue_float] = None  # NEW added: 임피던스 추적 오차 저장. (한국어 주석)
 
     def __getitem__(self, idx):
         d_list = [
@@ -58,6 +63,7 @@ class ArmReacherMetrics(RolloutMetrics):
             self.pose_error,
             self.goalset_index,
             self.null_space_error,
+            self.admittance_error,  # NEW added: 임피던스 오차를 메트릭 리스트에 포함. (한국어 주석)
         ]
         idx_vals = list_idx_if_not_none(d_list, idx)
         return ArmReacherMetrics(*idx_vals)
@@ -78,6 +84,10 @@ class ArmReacherMetrics(RolloutMetrics):
             null_space_error=(
                 None if self.null_space_error is None else self.null_space_error.clone()
             ),
+            admittance_error=(
+                None if self.admittance_error is None else self.admittance_error.clone()
+            ),
+            # NEW added: 임피던스 오차 텐서를 깊은 복사해 외부 사용 시 안전성을 확보. (한국어 주석)
         )
 
 
@@ -90,11 +100,13 @@ class ArmReacherCostConfig(ArmCostConfig):
     zero_vel_cfg: Optional[CostConfig] = None
     zero_jerk_cfg: Optional[CostConfig] = None
     link_pose_cfg: Optional[PoseCostConfig] = None
+    admittance_cfg: Optional[AdmittanceCostConfig] = None  # NEW added: 임피던스 비용 설정 항목. (한국어 주석)
 
     @staticmethod
     def _get_base_keys():
         base_k = ArmCostConfig._get_base_keys()
         # add new cost terms:
+        # NEW added: 임피던스 관련 키를 포함해 확장된 비용 사전을 구성. (한국어 주석)
         new_k = {
             "pose_cfg": PoseCostConfig,
             "cspace_cfg": DistCostConfig,
@@ -103,6 +115,7 @@ class ArmReacherCostConfig(ArmCostConfig):
             "zero_vel_cfg": CostConfig,
             "zero_jerk_cfg": CostConfig,
             "link_pose_cfg": PoseCostConfig,
+            "admittance_cfg": AdmittanceCostConfig,
         }
         new_k.update(base_k)
         return new_k
@@ -210,6 +223,11 @@ class ArmReacher(ArmBase, ArmReacherConfig):
             if self.zero_jerk_cost.hinge_value is not None:
                 self._compute_g_dist = True
 
+        self.admittance_cost = None  # NEW added: 임피던스 비용 인스턴스 포인터 초기화. (한국어 주석)
+        if self.cost_cfg.admittance_cfg is not None:
+            # NEW added: 설정이 존재하면 임피던스 비용 인스턴스를 생성한다. (한국어 주석)
+            self.admittance_cost = AdmittanceCost(self.cost_cfg.admittance_cfg)
+
         self.z_tensor = torch.tensor(
             0, device=self.tensor_args.device, dtype=self.tensor_args.dtype
         )
@@ -233,19 +251,32 @@ class ArmReacher(ArmBase, ArmReacherConfig):
 
         # check if g_dist is required in any of the cost terms:
         self.update_params(Goal(current_state=self._start_state))
+        self._contact_wrench = None  # NEW added: 측정된 렌치를 저장하는 캐시 초기화. (한국어 주석)
+        self._contact_cartesian_error = None  # NEW added: EE 오차 벡터 캐시 초기화. (한국어 주석)
+        self._task_cost_labels = ["safety", "admittance", "tracking"]  # NEW added: 계층형 비용 레이블 정의. (한국어 주석)
 
     def cost_fn(self, state: KinematicModelState, action_batch=None):
-        """
-        Compute cost given that state dictionary and actions
+        """Compute weighted cost terms for all tasks."""
 
-
-        :class:`curobo.rollout.cost.PoseCost`
-        :class:`curobo.rollout.cost.DistCost`
-
-        """
         state_batch = state.state_seq
         with profiler.record_function("cost/base"):
-            cost_list = super(ArmReacher, self).cost_fn(state, action_batch, return_list=True)
+            base_costs = super(ArmReacher, self).cost_fn(state, action_batch, return_list=True)
+
+        cost_terms = list(base_costs)
+        safety_cost = None
+        zeros_like_cost = None
+        if len(cost_terms) > 0:
+            safety_cost = cat_sum_reacher(cost_terms)
+            zeros_like_cost = torch.zeros_like(safety_cost)
+        if zeros_like_cost is None:
+            zeros_like_cost = torch.zeros(
+                state_batch.position.shape[0],
+                state_batch.position.shape[1],
+                device=self.tensor_args.device,
+                dtype=self.tensor_args.dtype,
+            )
+
+        tracking_terms: List[torch.Tensor] = []
         ee_pos_batch, ee_quat_batch = state.ee_pos_seq, state.ee_quat_seq
         g_dist = None
         with profiler.record_function("cost/pose"):
@@ -260,76 +291,88 @@ class ArmReacher(ArmBase, ArmReacherConfig):
                         ee_quat_batch,
                         self._goal_buffer,
                     )
-
                     g_dist = _compute_g_dist_jit(rot_err_norm, goal_dist)
                 else:
                     goal_cost = self.goal_cost.forward(
                         ee_pos_batch, ee_quat_batch, self._goal_buffer
                     )
-                cost_list.append(goal_cost)
+                cost_terms.append(goal_cost)
+                tracking_terms.append(goal_cost)
+
         with profiler.record_function("cost/link_poses"):
             if self._goal_buffer.links_goal_pose is not None and self.cost_cfg.pose_cfg is not None:
                 link_poses = state.link_pose
-
                 for k in self._goal_buffer.links_goal_pose.keys():
                     if k != self.kinematics.ee_link:
                         current_fn = self._link_pose_costs[k]
                         if current_fn.enabled:
-                            # get link pose
                             current_pose = link_poses[k].contiguous()
                             current_pos = current_pose.position
                             current_quat = current_pose.quaternion
-
                             c = current_fn.forward(current_pos, current_quat, self._goal_buffer, k)
-                            cost_list.append(c)
+                            cost_terms.append(c)
+                            tracking_terms.append(c)
 
         if (
             self._goal_buffer.goal_state is not None
             and self.cost_cfg.cspace_cfg is not None
             and self.dist_cost.enabled
         ):
-
             joint_cost = self.dist_cost.forward_target_idx(
                 self._goal_buffer.goal_state.position,
                 state_batch.position,
                 self._goal_buffer.batch_goal_state_idx,
             )
-            cost_list.append(joint_cost)
+            cost_terms.append(joint_cost)
+            tracking_terms.append(joint_cost)
+
         if self.cost_cfg.straight_line_cfg is not None and self.straight_line_cost.enabled:
             st_cost = self.straight_line_cost.forward(ee_pos_batch)
-            cost_list.append(st_cost)
+            cost_terms.append(st_cost)
+            tracking_terms.append(st_cost)
 
-        if (
-            self.cost_cfg.zero_acc_cfg is not None
-            and self.zero_acc_cost.enabled
-            # and g_dist is not None
-        ):
-            z_acc = self.zero_acc_cost.forward(
-                state_batch.acceleration,
-                g_dist,
-            )
+        if self.cost_cfg.zero_acc_cfg is not None and self.zero_acc_cost.enabled:
+            z_acc = self.zero_acc_cost.forward(state_batch.acceleration, g_dist)
+            cost_terms.append(z_acc)
+            tracking_terms.append(z_acc)
 
-            cost_list.append(z_acc)
         if self.cost_cfg.zero_jerk_cfg is not None and self.zero_jerk_cost.enabled:
-            z_jerk = self.zero_jerk_cost.forward(
-                state_batch.jerk,
-                g_dist,
-            )
-            cost_list.append(z_jerk)
+            z_jerk = self.zero_jerk_cost.forward(state_batch.jerk, g_dist)
+            cost_terms.append(z_jerk)
+            tracking_terms.append(z_jerk)
 
         if self.cost_cfg.zero_vel_cfg is not None and self.zero_vel_cost.enabled:
-            z_vel = self.zero_vel_cost.forward(
-                state_batch.velocity,
-                g_dist,
+            z_vel = self.zero_vel_cost.forward(state_batch.velocity, g_dist)
+            cost_terms.append(z_vel)
+            tracking_terms.append(z_vel)
+
+        admittance_cost = None  # NEW added: 임피던스 비용 초기화. (한국어 주석)
+        if self.admittance_cost is not None and self.admittance_cost.enabled:
+            # NEW added: 측정된 접촉 렌치와 카티시안 오차를 이용해 임피던스 비용을 평가. (한국어 주석)
+            admittance_cost = self.admittance_cost.forward(
+                self._contact_wrench,
+                self._contact_cartesian_error,
             )
-            cost_list.append(z_vel)
+            if torch.is_tensor(admittance_cost):
+                cost_terms.append(admittance_cost)
+            else:
+                admittance_cost = None
+
         with profiler.record_function("cat_sum"):
             if self.sum_horizon:
-                cost = cat_sum_horizon_reacher(cost_list)
+                total_cost = cat_sum_horizon_reacher(cost_terms)
             else:
-                cost = cat_sum_reacher(cost_list)
+                total_cost = cat_sum_reacher(cost_terms)
 
-        return cost
+        tracking_cost = (
+            cat_sum_reacher(tracking_terms) if len(tracking_terms) > 0 else zeros_like_cost
+        )
+        adm_cost = admittance_cost if admittance_cost is not None else zeros_like_cost
+        safety_term = safety_cost if safety_cost is not None else zeros_like_cost
+        # NEW added: 안전/임피던스/추종 비용을 계층형 MPPI가 사용하도록 저장. (한국어 주석)
+        self._task_cost_buffer = torch.stack([safety_term, adm_cost, tracking_cost], dim=1)
+
+        return total_cost
 
     def convergence_fn(
         self, state: KinematicModelState, out_metrics: Optional[ArmReacherMetrics] = None
@@ -403,6 +446,11 @@ class ArmReacher(ArmBase, ArmReacherConfig):
                 self._goal_buffer.batch_retract_state_idx,
             )
 
+        if self.admittance_cost is not None and self.admittance_cost.enabled:
+            adm_err = self.admittance_cost.last_error()
+            if adm_err is not None:
+                out_metrics.admittance_error = adm_err  # NEW added: 임피던스 오차를 메트릭으로 노출. (한국어 주석)
+
         return out_metrics
 
     def update_params(
@@ -421,6 +469,41 @@ class ArmReacher(ArmBase, ArmReacherConfig):
             self.enable_cspace_cost(False)
         return True
 
+    def update_contact_measurement(
+        self,
+        contact_wrench: Optional[torch.Tensor],
+        position_error: Optional[torch.Tensor] = None,
+        velocity_error: Optional[torch.Tensor] = None,
+        acceleration_error: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Cache the latest measured wrench and optional Cartesian errors."""
+
+        if contact_wrench is None:
+            # NEW added: 접촉이 없으면 캐시를 초기화해 불필요한 비용 계산을 방지. (한국어 주석)
+            self._contact_wrench = None
+            self._contact_cartesian_error = None
+            return
+
+        wrench = self.tensor_args.to_device(contact_wrench)
+        if wrench.dim() == 1:
+            wrench = wrench.view(1, -1)
+        self._contact_wrench = wrench  # NEW added: 최신 렌치를 GPU 텐서로 저장. (한국어 주석)
+
+        cartesian_chunks = []  # NEW added: 위치/속도/가속 오차를 순서대로 누적. (한국어 주석)
+        for item in (position_error, velocity_error, acceleration_error):
+            if item is None:
+                cartesian_chunks.append(
+                    torch.zeros_like(wrench[:, :6])
+                )  # NEW added: 결측값은 영벡터로 채워 임피던스 입력을 안정화. (한국어 주석)
+            else:
+                tensor_item = self.tensor_args.to_device(item)
+                if tensor_item.dim() == 1:
+                    tensor_item = tensor_item.view(1, -1)
+                cartesian_chunks.append(tensor_item)  # NEW added: 사용자 제공 오차를 그대로 사용. (한국어 주석)
+
+        self._contact_cartesian_error = torch.cat(cartesian_chunks, dim=-1)
+        # NEW added: 위치/속도/가속 오차를 하나의 벡터로 결합해 비용 함수에 전달. (한국어 주석)
+        
     def enable_pose_cost(self, enable: bool = True):
         if enable:
             self.goal_cost.enable_cost()
