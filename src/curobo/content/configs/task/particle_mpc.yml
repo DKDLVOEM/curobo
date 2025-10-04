@@ -65,6 +65,14 @@ cost:
     weight: 50000.0
     classify: False
 
+  # NEW added: 접촉 임피던스 비용 파라미터를 구성해 MPC가 힘 추적을 학습. (한국어 주석)
+  admittance_cfg:  # NEW added: 임피던스 비용에 사용될 파라미터 묶음. (한국어 주석)
+    weight: [1.0, 1.0, 1.0, 0.1, 0.1, 0.1]  # NEW added: 힘/토크 축별 비용 가중치. (한국어 주석)
+    desired_wrench: [0.0, 0.0, 5.0, 0.0, 0.0, 0.0]  # NEW added: 목표 접촉 렌치 설정. (한국어 주석)
+    stiffness: [15.0, 15.0, 15.0, 0.0, 0.0, 0.0]  # NEW added: 위치 오차에 곱할 강성 계수. (한국어 주석)
+    damping: [5.0, 5.0, 5.0, 0.0, 0.0, 0.0]  # NEW added: 속도 오차에 곱할 감쇠 계수. (한국어 주석)
+    activation_threshold: 1.0  # NEW added: 활성화에 필요한 최소 힘 크기. (한국어 주석)
+
 
   stop_cfg:
     weight: 100.0 #50.0
@@ -105,3 +113,15 @@ mppi:
     n_knots: 5
   debug_info:
     visual_traj       : 'ee_pos_seq'
+  hierarchy_cfg:  # NEW added: 계층형 MPPI 우선순위와 가중치를 정의. (한국어 주석)
+    task_order: ["safety", "admittance", "tracking"]  # NEW added: 우선순위 순서를 지정. (한국어 주석)
+    task_weights:  # NEW added: 작업별 가중치 사전. (한국어 주석)
+      safety: 1.0  # NEW added: 안전 비용에 적용할 가중치. (한국어 주석)
+      admittance: 0.5  # NEW added: 임피던스 비용 가중치. (한국어 주석)
+      tracking: 1.0  # NEW added: 추종 비용 가중치. (한국어 주석)
+    feasibility_thresholds:  # NEW added: 허용 가능한 비용 한계. (한국어 주석)
+      safety: 1.0e3  # NEW added: 안전 비용 허용 상한. (한국어 주석)
+      admittance: 5.0e2  # NEW added: 임피던스 비용 허용 상한. (한국어 주석)
+    violation_penalty: 1.0e4  # NEW added: 계층 위반 시 부과할 벌점. (한국어 주석)
+    nullspace_damping: 0.2  # NEW added: 접촉 시 null-space 감쇠 계수. (한국어 주석)
+    contact_activation_norm: 5.0  # NEW added: null-space 감쇠를 켜는 힘 노름 기준. (한국어 주석)

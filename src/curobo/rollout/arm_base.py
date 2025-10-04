@@ -231,6 +231,7 @@ class ArmBase(RolloutBase, ArmBaseConfig):
             ArmBaseConfig.__init__(self, **vars(config))
         RolloutBase.__init__(self)
         self._init_after_config_load()
+        self._task_cost_buffer = None  # NEW added: 계층 비용 전달을 위한 임시 버퍼 초기화. (한국어 주석)
 
     @profiler.record_function("arm_base/init_after_config_load")
     def _init_after_config_load(self):
@@ -370,11 +371,13 @@ class ArmBase(RolloutBase, ArmBaseConfig):
                 )
                 cost_list.append(coll_cost)
         if return_list:
+            self._task_cost_buffer = None  # NEW added: 그래프 캡처 중 중복 저장을 방지. (한국어 주석)
             return cost_list
         if self.sum_horizon:
             cost = cat_sum_horizon(cost_list)
         else:
             cost = cat_sum(cost_list)
+        self._task_cost_buffer = None  # NEW added: 사용 후 버퍼를 즉시 비워 재사용. (한국어 주석)
         return cost
 
     def constraint_fn(
@@ -602,7 +605,17 @@ class ArmBase(RolloutBase, ArmBaseConfig):
         with profiler.record_function("cost/all"):
             cost_seq = self.cost_fn(state, act_seq)
 
-        sim_trajs = Trajectory(actions=act_seq, costs=cost_seq, state=state)
+        # NEW added: 계층형 MPPI가 참조할 수 있도록 비용 항목들을 버퍼에 저장. (한국어 주석)
+        task_costs = getattr(self, "_task_cost_buffer", None)  # NEW added: 계층 비용 텐서를 꺼내옴. (한국어 주석)
+        task_labels = getattr(self, "_task_cost_labels", None)  # NEW added: 저장된 레이블로 계층 비용을 식별. (한국어 주석)
+        sim_trajs = Trajectory(  # NEW added: 계층 비용 정보를 포함한 궤적 결과. (한국어 주석)
+            actions=act_seq,
+            costs=cost_seq,
+            state=state,
+            task_costs=task_costs,
+            task_labels=task_labels,
+        )
+        self._task_cost_buffer = None  # NEW added: 다음 샘플링 전에 버퍼를 초기화. (한국어 주석)
 
         return sim_trajs
 

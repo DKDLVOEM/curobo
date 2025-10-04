@@ -74,6 +74,8 @@ class Trajectory:
     costs: T_BHValue_float
     state: Optional[State] = None
     debug: Optional[dict] = None
+    task_costs: Optional[torch.Tensor] = None
+    task_labels: Optional[Sequence[str]] = None
 
 
 @dataclass

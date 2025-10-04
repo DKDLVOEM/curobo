@@ -511,6 +511,10 @@ class MpcSolver(MpcSolverConfig):
         shift_steps: int = 1,
         seed_traj: Optional[JointState] = None,
         max_attempts: int = 1,
+        contact_wrench: Optional[torch.Tensor] = None,
+        contact_position_error: Optional[torch.Tensor] = None,
+        contact_velocity_error: Optional[torch.Tensor] = None,
+        contact_acceleration_error: Optional[torch.Tensor] = None,
     ):
         """Solve for the next action given the current state.
 
@@ -520,14 +524,28 @@ class MpcSolver(MpcSolverConfig):
             seed_traj: Initial trajectory to seed the optimization. If None, the solver
                 uses the solution from the previous step.
             max_attempts: Maximum number of attempts to solve the problem.
+            contact_wrench: Optional measured wrench applied at the end-effector.
+            contact_position_error: Optional Cartesian position error for admittance tracking.
+            contact_velocity_error: Optional Cartesian velocity error for admittance tracking.
+            contact_acceleration_error: Optional Cartesian acceleration error for admittance tracking.
 
         Returns:
             WrapResult: Result of the optimization.
         """
+        # NEW added: 접촉 기반 입력을 포함해 계층형 MPPI를 구동하기 위한 스텝 루프. (한국어 주석)
         converged = True
 
         for _ in range(max_attempts):
-            result = self._step_once(current_state.clone(), shift_steps, seed_traj)
+            # NEW added: 계층형 임피던스 처리를 위해 최신 접촉 정보를 포함해 단일 스텝을 해결. (한국어 주석)
+            result = self._step_once(
+                current_state.clone(),
+                shift_steps,
+                seed_traj,
+                contact_wrench=contact_wrench,
+                contact_position_error=contact_position_error,
+                contact_velocity_error=contact_velocity_error,
+                contact_acceleration_error=contact_acceleration_error,
+            )
             if (
                 torch.count_nonzero(torch.isnan(result.action.position)) == 0
                 and torch.count_nonzero(~result.metrics.feasible) == 0
@@ -738,6 +756,10 @@ class MpcSolver(MpcSolverConfig):
         current_state: JointState,
         shift_steps: int = 1,
         seed_traj: Optional[JointState] = None,
+        contact_wrench: Optional[torch.Tensor] = None,
+        contact_position_error: Optional[torch.Tensor] = None,
+        contact_velocity_error: Optional[torch.Tensor] = None,
+        contact_acceleration_error: Optional[torch.Tensor] = None,
     ) -> WrapResult:
         """Solve for the next action given the current state.
 
@@ -746,10 +768,15 @@ class MpcSolver(MpcSolverConfig):
             shift_steps: Number of steps to shift the trajectory.
             seed_traj: Initial trajectory to seed the optimization. If None, the solver
                 uses the solution from the previous step.
+            contact_wrench: Optional wrench measurement to update admittance cost.
+            contact_position_error: Optional Cartesian position error for admittance tracking.
+            contact_velocity_error: Optional Cartesian velocity error.
+            contact_acceleration_error: Optional Cartesian acceleration error.
 
         Returns:
             WrapResult: Result of the optimization.
         """
+        # NEW added: cuda graph 경로와 비그래프 경로 모두에서 접촉 정보를 공유하도록 확장. (한국어 주석)
         # Create cuda graph for whole solve step including computation of metrics
         # Including updation of goal buffers
 
@@ -769,6 +796,13 @@ class MpcSolver(MpcSolverConfig):
             result.solve_time = time.time() - st_time
         else:
             self._step_goal_buffer.current_state.copy_(current_state)
+            # NEW added: 모든 롤아웃에 측정된 렌치/오차를 전달해 비용을 동기화. (한국어 주석)
+            self._update_contact_measurement(
+                contact_wrench,
+                contact_position_error,
+                contact_velocity_error,
+                contact_acceleration_error,
+            )
             result = self._solve_from_solve_state(
                 self._solve_state,
                 self._step_goal_buffer,
@@ -777,6 +811,25 @@ class MpcSolver(MpcSolverConfig):
             )
 
         return result
+
+    def _update_contact_measurement(
+        self,
+        contact_wrench: Optional[torch.Tensor],
+        contact_position_error: Optional[torch.Tensor],
+        contact_velocity_error: Optional[torch.Tensor],
+        contact_acceleration_error: Optional[torch.Tensor],
+    ) -> None:
+        # NEW added: 안전 롤아웃과 최적화기 모두 동일한 임피던스 입력을 공유하도록 전달. (한국어 주석)
+        rollout_list = [self.rollout_fn, self.solver.safety_rollout]  # NEW added: 메인/안전 롤아웃을 포함한 목록 작성. (한국어 주석)
+        rollout_list.extend([opt.rollout_fn for opt in self.solver.optimizers])  # NEW added: 모든 최적화기 롤아웃도 포함. (한국어 주석)
+        for rollout in rollout_list:
+            if hasattr(rollout, "update_contact_measurement"):
+                rollout.update_contact_measurement(
+                    contact_wrench,
+                    position_error=contact_position_error,
+                    velocity_error=contact_velocity_error,
+                    acceleration_error=contact_acceleration_error,
+                )
 
     def _update_solve_state_and_goal_buffer(
         self,

@@ -269,6 +269,18 @@ if __name__ == "__main__":
     default_config = robot_cfg["kinematics"]["cspace"]["retract_config"]
     robot_cfg["kinematics"]["collision_sphere_buffer"] = 0.02
     robot, _ = add_robot_to_scene(robot_cfg, my_world, "/World/world_robot/")
+    # NEW added: 끝단 링크 이름으로 접촉 렌치 인덱스를 매칭하기 위한 준비. (한국어 주석)
+    ee_link_name = robot_cfg["kinematics"].get("ee_link", "")
+    try:
+        body_names = robot._articulation_view.get_body_names()
+    except AttributeError:
+        body_names = []  # NEW added: 바디 이름 API 미지원 시 빈 목록으로 처리. (한국어 주석)
+    ee_body_index = None  # NEW added: 끝단 링크 인덱스를 찾기 위한 초기값. (한국어 주석)
+    for idx, name in enumerate(body_names):
+        # NEW added: Isaac Sim 바디 이름을 순회하며 EE 인덱스를 캐시한다. (한국어 주석)
+        if name == ee_link_name or name.endswith(ee_link_name):
+            ee_body_index = idx
+            break
 
     world_cfg_table = WorldConfig.from_dict(
         load_yaml(join_path(get_world_configs_path(), "collision_wall.yml"))
@@ -428,6 +440,40 @@ if __name__ == "__main__":
         )
         cu_js = cu_js.get_ordered_joint_state(mpc.rollout_fn.joint_names)
 
+        # NEW added: 끝단 접촉 렌치를 읽어와 MPC에 전달하기 위한 변수 초기화. (한국어 주석)
+        contact_wrench = None  # NEW added: 초기 접촉 렌치 없음. (한국어 주석)
+        contact_position_error = None  # NEW added: 초기 EE 위치 오차 없음. (한국어 주석)
+        contact_velocity_error = None  # NEW added: 초기 EE 속도 오차 없음. (한국어 주석)
+        contact_acceleration_error = None  # NEW added: 초기 EE 가속 오차 없음. (한국어 주석)
+        if ee_body_index is not None:
+            try:
+                net_forces = robot._articulation_view.get_net_contact_forces()
+                ee_force = np.array(net_forces[0, ee_body_index])  # NEW added: EE 순수 힘 벡터 추출. (한국어 주석)
+                try:
+                    net_torques = robot._articulation_view.get_net_contact_torques()
+                    ee_torque = np.array(net_torques[0, ee_body_index])  # NEW added: EE 토크 추출. (한국어 주석)
+                except AttributeError:
+                    ee_torque = np.zeros(3, dtype=np.float32)  # NEW added: 토크 API 미지원 시 영벡터 사용. (한국어 주석)
+                contact_wrench = np.concatenate([ee_force, ee_torque])  # NEW added: 힘/토크를 하나의 렌치로 결합. (한국어 주석)
+            except Exception:
+                contact_wrench = None  # NEW added: 예외 발생 시 렌치를 비워 안전 동작. (한국어 주석)
+
+        if contact_wrench is not None:
+            # NEW added: 접촉이 감지되면 목표 대비 위치/속도/가속 오차를 계산해 임피던스 비용에 활용. (한국어 주석)
+            kin_state = mpc.compute_kinematics(cu_js)  # NEW added: 현재 관절 상태로 EE 포즈 계산. (한국어 주석)
+            ee_pos = kin_state.ee_pos_seq.squeeze()
+            goal_pos = goal_buffer.goal_pose.position.squeeze()
+            pos_error = ee_pos - goal_pos  # NEW added: 목표 대비 EE 위치 오차 계산. (한국어 주석)
+            rot_error = torch.zeros_like(pos_error)  # NEW added: 간단화를 위해 회전 오차는 영으로 설정. (한국어 주석)
+            contact_position_error = torch.cat((pos_error, rot_error))  # NEW added: 선형/회전 오차 결합. (한국어 주석)
+            zeros_like_error = torch.zeros_like(contact_position_error)  # NEW added: 속도/가속 오차 초기화. (한국어 주석)
+            contact_velocity_error = zeros_like_error
+            contact_acceleration_error = zeros_like_error
+            contact_wrench = tensor_args.to_device(contact_wrench)  # NEW added: 측정 렌치를 GPU 텐서로 변환. (한국어 주석)
+            contact_position_error = tensor_args.to_device(contact_position_error)  # NEW added: EE 위치 오차를 GPU로 복사. (한국어 주석)
+            contact_velocity_error = tensor_args.to_device(contact_velocity_error)  # NEW added: EE 속도 오차를 GPU로 복사. (한국어 주석)
+            contact_acceleration_error = tensor_args.to_device(contact_acceleration_error)  # NEW added: EE 가속도 오차를 GPU로 복사. (한국어 주석)
+
         if cmd_state_full is None:
             current_state.copy_(cu_js)
         else:
@@ -464,7 +510,14 @@ if __name__ == "__main__":
                 target_idx = 0
 
         if cmd_step_idx == 0:
-            mpc_result = mpc.step(current_state, max_attempts=2)
+            mpc_result = mpc.step(
+                current_state,
+                max_attempts=2,
+                contact_wrench=contact_wrench,  # NEW added: 임피던스 비용 업데이트에 사용. (한국어 주석)
+                contact_position_error=contact_position_error,  # NEW added: EE 위치 오차 전달. (한국어 주석)
+                contact_velocity_error=contact_velocity_error,  # NEW added: EE 속도 오차 전달. (한국어 주석)
+                contact_acceleration_error=contact_acceleration_error,  # NEW added: EE 가속 오차 전달. (한국어 주석)
+            )
             current_error = mpc_result.metrics.pose_error.item()
         cmd_state_full = mpc_result.js_action
         common_js_names = []
