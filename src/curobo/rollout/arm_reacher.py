@@ -551,6 +551,7 @@ class ArmReacher(ArmBase, ArmReacherConfig):
 @get_torch_jit_decorator()
 def cat_sum_reacher(tensor_list: List[torch.Tensor]):
     valid_tensors: List[torch.Tensor] = []
+# <<<<<<< aciui4-codex/update-yaml-file-loaders-for-utf-8-encoding
     reference_tensor: Optional[torch.Tensor] = None
     fallback_tensor: Optional[torch.Tensor] = None
 
@@ -576,6 +577,19 @@ def cat_sum_reacher(tensor_list: List[torch.Tensor]):
         if fallback_tensor is None:
             return torch.tensor(0.0)
         return torch.zeros_like(fallback_tensor)
+# =======
+#     if len(tensor_list) > 0:
+#         reference_tensor: torch.Tensor = tensor_list[0]
+#     else:
+#         reference_tensor = torch.zeros(0)
+
+#     for tensor in tensor_list:
+#         if tensor.numel() > 0:
+#             valid_tensors.append(tensor)
+
+#     if len(valid_tensors) == 0:
+#         return torch.zeros_like(reference_tensor)
+# >>>>>>> main
 
     cat_tensor = torch.sum(torch.stack(valid_tensors, dim=0), dim=0)
     return cat_tensor
@@ -584,6 +598,7 @@ def cat_sum_reacher(tensor_list: List[torch.Tensor]):
 @get_torch_jit_decorator()
 def cat_sum_horizon_reacher(tensor_list: List[torch.Tensor]):
     valid_tensors: List[torch.Tensor] = []
+# <<<<<<< aciui4-codex/update-yaml-file-loaders-for-utf-8-encoding
     reference_tensor: Optional[torch.Tensor] = None
     fallback_tensor: Optional[torch.Tensor] = None
 
@@ -612,6 +627,19 @@ def cat_sum_horizon_reacher(tensor_list: List[torch.Tensor]):
             return torch.zeros_like(fallback_tensor)
         zero_tensor = torch.zeros_like(fallback_tensor)
         return torch.sum(zero_tensor, dim=-1)
+# =======
+#     if len(tensor_list) > 0:
+#         reference_tensor: torch.Tensor = tensor_list[0]
+#     else:
+#         reference_tensor = torch.zeros(0)
+
+#     for tensor in tensor_list:
+#         if tensor.numel() > 0:
+#             valid_tensors.append(tensor)
+
+#     if len(valid_tensors) == 0:
+#         return torch.zeros_like(reference_tensor)
+# >>>>>>> main
 
     cat_tensor = torch.sum(torch.stack(valid_tensors, dim=0), dim=(0, -1))
     return cat_tensor
