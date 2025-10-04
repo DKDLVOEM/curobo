@@ -122,7 +122,7 @@ def load_yaml(file_path: Union[str, Dict]) -> Dict:
         Dict: Dictionary containing yaml file content.
     """
     if isinstance(file_path, str):
-        with open(file_path) as file_p:
+        with open(file_path, encoding="utf-8") as file_p:
             yaml_params = yaml.load(file_p, Loader=Loader)
     else:
         yaml_params = file_path
@@ -136,7 +136,7 @@ def write_yaml(data: Dict, file_path: str):
         data: Dictionary to write to yaml file.
         file_path: Path to write the yaml file.
     """
-    with open(file_path, "w") as file:
+    with open(file_path, "w", encoding="utf-8") as file:
         yaml.dump(data, file)
 
 

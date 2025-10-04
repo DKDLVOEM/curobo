@@ -550,11 +550,68 @@ class ArmReacher(ArmBase, ArmReacherConfig):
 
 @get_torch_jit_decorator()
 def cat_sum_reacher(tensor_list: List[torch.Tensor]):
-    cat_tensor = torch.sum(torch.stack(tensor_list, dim=0), dim=0)
+    valid_tensors: List[torch.Tensor] = []
+    reference_tensor: Optional[torch.Tensor] = None
+    fallback_tensor: Optional[torch.Tensor] = None
+
+    for tensor in tensor_list:
+        if fallback_tensor is None:
+            fallback_tensor = tensor
+
+        if tensor.numel() == 0:
+            continue
+
+        if reference_tensor is None:
+            reference_tensor = tensor
+
+        if (
+            reference_tensor is not None
+            and tensor.shape == reference_tensor.shape
+            and tensor.dtype == reference_tensor.dtype
+            and tensor.device == reference_tensor.device
+        ):
+            valid_tensors.append(tensor)
+
+    if reference_tensor is None:
+        if fallback_tensor is None:
+            return torch.tensor(0.0)
+        return torch.zeros_like(fallback_tensor)
+
+    cat_tensor = torch.sum(torch.stack(valid_tensors, dim=0), dim=0)
     return cat_tensor
 
 
 @get_torch_jit_decorator()
 def cat_sum_horizon_reacher(tensor_list: List[torch.Tensor]):
-    cat_tensor = torch.sum(torch.stack(tensor_list, dim=0), dim=(0, -1))
+    valid_tensors: List[torch.Tensor] = []
+    reference_tensor: Optional[torch.Tensor] = None
+    fallback_tensor: Optional[torch.Tensor] = None
+
+    for tensor in tensor_list:
+        if fallback_tensor is None:
+            fallback_tensor = tensor
+
+        if tensor.numel() == 0 or tensor.dim() == 0:
+            continue
+
+        if reference_tensor is None:
+            reference_tensor = tensor
+
+        if (
+            reference_tensor is not None
+            and tensor.shape == reference_tensor.shape
+            and tensor.dtype == reference_tensor.dtype
+            and tensor.device == reference_tensor.device
+        ):
+            valid_tensors.append(tensor)
+
+    if reference_tensor is None:
+        if fallback_tensor is None:
+            return torch.tensor(0.0)
+        if fallback_tensor.dim() == 0:
+            return torch.zeros_like(fallback_tensor)
+        zero_tensor = torch.zeros_like(fallback_tensor)
+        return torch.sum(zero_tensor, dim=-1)
+
+    cat_tensor = torch.sum(torch.stack(valid_tensors, dim=0), dim=(0, -1))
     return cat_tensor
