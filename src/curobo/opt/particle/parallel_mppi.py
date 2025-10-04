@@ -189,6 +189,14 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
         self._nullspace_damping: float = float(
             self.hierarchy_cfg.get("nullspace_damping", 0.0)
         )
+        self._hierarchy_threshold_tensors: Dict[str, torch.Tensor] = {}
+        device = self.tensor_args.device
+        dtype = self.tensor_args.dtype
+        for label, value in self._hierarchy_thresholds.items():
+            self._hierarchy_threshold_tensors[label] = torch.tensor(
+                float(value), device=device, dtype=dtype
+            )
+        self._zero_scalar = torch.zeros((), device=device, dtype=dtype)
 
     def get_rollouts(self):
         return self.top_trajs
@@ -274,14 +282,16 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
         num_tasks = task_costs.shape[-2]
         particles_per_problem = self.total_num_particles // self.n_problems
         reshaped = task_costs.view(self.n_problems, particles_per_problem, num_tasks, horizon)  # NEW added: 문제-입자-작업 구조로 재배열. (한국어 주석)
-        combined = torch.zeros(  # NEW added: 우선순위 누적 비용을 저장할 텐서 초기화. (한국어 주석)
+        combined = task_costs.new_zeros(
             self.n_problems,
             particles_per_problem,
             horizon,
-            device=task_costs.device,
-            dtype=task_costs.dtype,
         )
         mask = torch.ones_like(combined, dtype=torch.bool)  # NEW added: 우선순위 위반을 누적 마스킹. (한국어 주석)
+        zero_scalar = self._zero_scalar
+        if zero_scalar.device != task_costs.device or zero_scalar.dtype != task_costs.dtype:
+            zero_scalar = zero_scalar.to(device=task_costs.device, dtype=task_costs.dtype)
+            self._zero_scalar = zero_scalar
 
         for label in self._hierarchy_order:
             idx = label_to_index.get(label)
@@ -290,13 +300,24 @@ class ParallelMPPI(ParticleOptBase, ParallelMPPIConfig):
             # NEW added: 각 작업의 가중치를 적용하고 허용 임계값을 넘으면 마스킹 처리. (한국어 주석)
             component = reshaped[:, :, idx, :]
             weight = self._hierarchy_weights.get(label, 1.0)
-            component_weighted = weight * component * mask.to(component.dtype)  # NEW added: 우선순위 가중치를 적용한 비용. (한국어 주석)
+            masked_component = torch.where(mask, component, zero_scalar)
+            component_weighted = weight * masked_component  # NEW added: 우선순위 가중치를 적용한 비용. (한국어 주석)
             combined = combined + component_weighted  # NEW added: 누적 비용에 합산. (한국어 주석)
             threshold = self._hierarchy_thresholds.get(label)
             if threshold is not None:
-                threshold_tensor = component.new_tensor(threshold)
+                threshold_tensor = self._hierarchy_threshold_tensors.get(label)
+                if threshold_tensor is None:
+                    continue
+                if (
+                    threshold_tensor.device != component.device
+                    or threshold_tensor.dtype != component.dtype
+                ):
+                    threshold_tensor = threshold_tensor.to(
+                        device=component.device, dtype=component.dtype
+                    )
+                    self._hierarchy_threshold_tensors[label] = threshold_tensor
                 violation = component > threshold_tensor  # NEW added: 임계값 초과 여부 계산. (한국어 주석)
-                excess = torch.where(violation, component - threshold_tensor, component.new_zeros(1))  # NEW added: 초과분 추정. (한국어 주석)
+                excess = torch.relu(component - threshold_tensor)  # NEW added: 초과분 추정. (한국어 주석)
                 combined = combined + self._hierarchy_penalty * excess  # NEW added: 페널티를 누적. (한국어 주석)
                 mask = mask & (~violation)  # NEW added: 위반된 샘플은 이후 작업에서 제외. (한국어 주석)
 
