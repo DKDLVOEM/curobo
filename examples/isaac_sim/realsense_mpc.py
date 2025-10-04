@@ -529,13 +529,19 @@ if __name__ == "__main__":
 
         cmd_state = cmd_state_full.get_ordered_joint_state(common_js_names)
         cmd_state_full = cmd_state
+        # 기존 문제
+        # art_action = ArticulationAction(
+        #     cmd_state.position.cpu().numpy(),
+        #     # cmd_state.velocity.cpu().numpy(),
+        #     joint_indices=idx_list,
+        # )
+        # articulation_controller.apply_action(art_action)
 
-        art_action = ArticulationAction(
-            cmd_state.position.cpu().numpy(),
-            # cmd_state.velocity.cpu().numpy(),
-            joint_indices=idx_list,
-        )
-        articulation_controller.apply_action(art_action)
+        # 새 코드 삽입
+        # kju: modify error
+        # set desired joint angles obtained from IK:
+        robot._articulation_view.set_joint_position_targets(positions=cmd_state.position.cpu().numpy(), joint_indices=idx_list)
+        robot._articulation_view.set_joint_velocity_targets(velocities=cmd_state.velocity.cpu().numpy(), joint_indices=idx_list)
 
         if cmd_step_idx == 2:
             cmd_step_idx = 0
@@ -543,15 +549,22 @@ if __name__ == "__main__":
         # positions_goal = a
         if cmd_plan is not None:
             cmd_state = cmd_plan[cmd_idx]
+            # 기존 문제
+            # # get full dof state
+            # art_action = ArticulationAction(
+            #     cmd_state.position.cpu().numpy(),
+            #     # cmd_state.velocity.cpu().numpy(),
+            #     joint_indices=idx_list,
+            # )
+            # # set desired joint angles obtained from IK:
+            # articulation_controller.apply_action(art_action)
 
-            # get full dof state
-            art_action = ArticulationAction(
-                cmd_state.position.cpu().numpy(),
-                # cmd_state.velocity.cpu().numpy(),
-                joint_indices=idx_list,
-            )
+            # 새 코드 삽입
+            # kju: modify error
             # set desired joint angles obtained from IK:
-            articulation_controller.apply_action(art_action)
+            robot._articulation_view.set_joint_position_targets(positions=cmd_state.position.cpu().numpy(), joint_indices=idx_list)
+            robot._articulation_view.set_joint_velocity_targets(velocities=cmd_state.velocity.cpu().numpy(), joint_indices=idx_list)
+ 
             cmd_step_idx += 1
             # for _ in range(2):
             #    my_world.step(render=False)
