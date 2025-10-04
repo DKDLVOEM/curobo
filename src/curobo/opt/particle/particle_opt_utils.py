@@ -10,6 +10,7 @@
 #
 # Standard Library
 from enum import Enum
+from typing import Optional, Tuple
 
 # Third Party
 import numpy as np
@@ -45,6 +46,60 @@ def scale_ctrl(ctrl, action_lows, action_highs, squash_fn: SquashType = SquashTy
     elif squash_fn == SquashType.IDENTITY:
         return ctrl
     return act_mid_range.unsqueeze(0) + ctrl * act_half_range.unsqueeze(0)
+
+
+def select_top_rollouts(
+    total_costs: torch.Tensor,
+    vis_seq: Optional[torch.Tensor],
+    n_problems: int,
+    particles_per_problem: int,
+    top_limit: int = 20,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
+    """Prepare top rollouts for visualization buffers.
+
+    Args:
+        total_costs: Raw cost tensor aggregated per rollout.
+        vis_seq: Rollout state tensor for visualization selection.
+        n_problems: Number of parallel problem instances.
+        particles_per_problem: Expected particle count per problem.
+        top_limit: Maximum number of rollouts to keep per problem.
+
+    Returns:
+        A tuple ``(top_values, top_indices, top_trajs, reshaped_costs)``. The first
+        three entries are ``None`` when there are no particles to rank.
+    """
+
+    if total_costs.dim() == 0:
+        total_costs = total_costs.unsqueeze(0)
+    if total_costs.numel() == 0:
+        reshaped = total_costs.new_zeros(n_problems, 0)
+        return None, None, None, reshaped
+    if total_costs.dim() == 1 or total_costs.shape[0] != n_problems:
+        reshaped = total_costs.view(n_problems, -1)
+    else:
+        reshaped = total_costs
+
+    if reshaped.shape[1] == 0:
+        return None, None, None, reshaped
+
+    particle_span = particles_per_problem if particles_per_problem > 0 else reshaped.shape[1]
+    particle_span = reshaped.shape[1] if particle_span == 0 else particle_span
+    top_k = min(top_limit, reshaped.shape[1])
+    if top_k == 0:
+        return None, None, None, reshaped
+
+    top_values, top_idx = torch.topk(reshaped, top_k, dim=1)
+    if vis_seq is None:
+        return top_values, top_idx, None, reshaped
+
+    offsets = (
+        torch.arange(n_problems, device=top_idx.device, dtype=top_idx.dtype)
+        .mul(particle_span)
+        .unsqueeze(-1)
+    )
+    flat_indices = top_idx + offsets
+    top_trajs = torch.index_select(vis_seq, 0, flat_indices.reshape(-1))
+    return top_values, top_idx, top_trajs, reshaped
 
 
 #######################
