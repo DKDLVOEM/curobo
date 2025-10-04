@@ -550,11 +550,37 @@ class ArmReacher(ArmBase, ArmReacherConfig):
 
 @get_torch_jit_decorator()
 def cat_sum_reacher(tensor_list: List[torch.Tensor]):
-    cat_tensor = torch.sum(torch.stack(tensor_list, dim=0), dim=0)
+    valid_tensors: List[torch.Tensor] = []
+    if len(tensor_list) > 0:
+        reference_tensor: torch.Tensor = tensor_list[0]
+    else:
+        reference_tensor = torch.zeros(0)
+
+    for tensor in tensor_list:
+        if tensor.numel() > 0:
+            valid_tensors.append(tensor)
+
+    if len(valid_tensors) == 0:
+        return torch.zeros_like(reference_tensor)
+
+    cat_tensor = torch.sum(torch.stack(valid_tensors, dim=0), dim=0)
     return cat_tensor
 
 
 @get_torch_jit_decorator()
 def cat_sum_horizon_reacher(tensor_list: List[torch.Tensor]):
-    cat_tensor = torch.sum(torch.stack(tensor_list, dim=0), dim=(0, -1))
+    valid_tensors: List[torch.Tensor] = []
+    if len(tensor_list) > 0:
+        reference_tensor: torch.Tensor = tensor_list[0]
+    else:
+        reference_tensor = torch.zeros(0)
+
+    for tensor in tensor_list:
+        if tensor.numel() > 0:
+            valid_tensors.append(tensor)
+
+    if len(valid_tensors) == 0:
+        return torch.zeros_like(reference_tensor)
+
+    cat_tensor = torch.sum(torch.stack(valid_tensors, dim=0), dim=(0, -1))
     return cat_tensor
