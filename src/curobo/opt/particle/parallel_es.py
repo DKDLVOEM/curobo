@@ -24,6 +24,7 @@ from curobo.opt.particle.parallel_mppi import (
     jit_blend_mean,
 )
 from curobo.opt.particle.particle_opt_base import SampleMode
+from curobo.opt.particle.particle_opt_utils import select_top_rollouts
 from curobo.util.torch_utils import get_torch_jit_decorator
 
 
@@ -86,16 +87,18 @@ class ParallelES(ParallelMPPI, ParallelESConfig):
         if self.store_rollouts and self.visual_traj is not None:
             total_costs = self._compute_total_cost(costs)
             vis_seq = getattr(trajectories.state, self.visual_traj)
-            top_values, top_idx = torch.topk(total_costs, 20, dim=1)
+            top_values, top_idx, top_trajs, total_costs = select_top_rollouts(
+                total_costs,
+                vis_seq,
+                self.n_problems,
+                self.particles_per_problem,
+                top_limit=20,
+            )
             self.top_values = top_values
             self.top_idx = top_idx
-            top_trajs = torch.index_select(vis_seq, 0, top_idx[0])
-            for i in range(1, top_idx.shape[0]):
-                trajs = torch.index_select(
-                    vis_seq, 0, top_idx[i] + (self.particles_per_problem * i)
-                )
-                top_trajs = torch.cat((top_trajs, trajs), dim=0)
-            if self.top_trajs is None or top_trajs.shape != self.top_trajs:
+            if top_trajs is None:
+                self.top_trajs = None
+            elif self.top_trajs is None or self.top_trajs.shape != top_trajs.shape:
                 self.top_trajs = top_trajs
             else:
                 self.top_trajs.copy_(top_trajs)
