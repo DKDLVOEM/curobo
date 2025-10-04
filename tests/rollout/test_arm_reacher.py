@@ -21,3 +21,14 @@ def test_cat_sum_reacher_ignores_mismatched_shapes():
     result = cat_sum_reacher([reference, mismatched])
 
     assert torch.allclose(result, reference)
+
+
+def test_cat_sum_reacher_only_scalars_returns_scalar_zero():
+    scalar_tensor = torch.tensor(5.0, dtype=torch.float32)
+
+    result = cat_sum_reacher([scalar_tensor])
+
+    assert result.shape == scalar_tensor.shape
+    assert result.dtype == scalar_tensor.dtype
+    assert result.device == scalar_tensor.device
+    assert result.item() == 0.0

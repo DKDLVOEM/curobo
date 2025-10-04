@@ -264,17 +264,22 @@ class ArmReacher(ArmBase, ArmReacherConfig):
 
         cost_terms = list(base_costs)
         safety_cost = None
-        zeros_like_cost = None
+
+        zeros_like_cost = torch.zeros(
+            state_batch.position.shape[0],
+            state_batch.position.shape[1],
+            device=self.tensor_args.device,
+            dtype=self.tensor_args.dtype,
+        )
+
         if len(cost_terms) > 0:
             safety_cost = cat_sum_reacher(cost_terms)
-            zeros_like_cost = torch.zeros_like(safety_cost)
-        if zeros_like_cost is None:
-            zeros_like_cost = torch.zeros(
-                state_batch.position.shape[0],
-                state_batch.position.shape[1],
-                device=self.tensor_args.device,
-                dtype=self.tensor_args.dtype,
-            )
+            if (
+                safety_cost.dim() != 2
+                or safety_cost.shape[0] != zeros_like_cost.shape[0]
+                or safety_cost.shape[1] != zeros_like_cost.shape[1]
+            ):
+                safety_cost = zeros_like_cost
 
         tracking_terms: List[torch.Tensor] = []
         ee_pos_batch, ee_quat_batch = state.ee_pos_seq, state.ee_quat_seq
@@ -354,7 +359,15 @@ class ArmReacher(ArmBase, ArmReacherConfig):
                 self._contact_cartesian_error,
             )
             if torch.is_tensor(admittance_cost):
-                cost_terms.append(admittance_cost)
+                if (
+                    admittance_cost.numel() == 0
+                    or admittance_cost.dim() != 2
+                    or admittance_cost.shape[0] != zeros_like_cost.shape[0]
+                    or admittance_cost.shape[1] != zeros_like_cost.shape[1]
+                ):
+                    admittance_cost = None
+                else:
+                    cost_terms.append(admittance_cost)
             else:
                 admittance_cost = None
 
@@ -367,10 +380,29 @@ class ArmReacher(ArmBase, ArmReacherConfig):
         tracking_cost = (
             cat_sum_reacher(tracking_terms) if len(tracking_terms) > 0 else zeros_like_cost
         )
+        if (
+            tracking_cost.dim() != 2
+            or tracking_cost.shape[0] != zeros_like_cost.shape[0]
+            or tracking_cost.shape[1] != zeros_like_cost.shape[1]
+        ):
+            tracking_cost = zeros_like_cost
+
         adm_cost = admittance_cost if admittance_cost is not None else zeros_like_cost
         safety_term = safety_cost if safety_cost is not None else zeros_like_cost
+
+        task_cost_terms = []
+        for term in (safety_term, adm_cost, tracking_cost):
+            if (
+                term.dim() != 2
+                or term.shape[0] != zeros_like_cost.shape[0]
+                or term.shape[1] != zeros_like_cost.shape[1]
+            ):
+                task_cost_terms.append(zeros_like_cost.clone())
+            else:
+                task_cost_terms.append(term)
+
         # NEW added: 안전/임피던스/추종 비용을 계층형 MPPI가 사용하도록 저장. (한국어 주석)
-        self._task_cost_buffer = torch.stack([safety_term, adm_cost, tracking_cost], dim=1)
+        self._task_cost_buffer = torch.stack(task_cost_terms, dim=1)
 
         return total_cost
 
@@ -551,54 +583,6 @@ class ArmReacher(ArmBase, ArmReacherConfig):
 @get_torch_jit_decorator()
 def cat_sum_reacher(tensor_list: List[torch.Tensor]):
     valid_tensors: List[torch.Tensor] = []
-# <<<<<<< aciui4-codex/update-yaml-file-loaders-for-utf-8-encoding
-    reference_tensor: Optional[torch.Tensor] = None
-    fallback_tensor: Optional[torch.Tensor] = None
-
-    for tensor in tensor_list:
-        if fallback_tensor is None:
-            fallback_tensor = tensor
-
-        if tensor.numel() == 0:
-            continue
-
-        if reference_tensor is None:
-            reference_tensor = tensor
-
-        if (
-            reference_tensor is not None
-            and tensor.shape == reference_tensor.shape
-            and tensor.dtype == reference_tensor.dtype
-            and tensor.device == reference_tensor.device
-        ):
-            valid_tensors.append(tensor)
-
-    if reference_tensor is None:
-        if fallback_tensor is None:
-            return torch.tensor(0.0)
-        return torch.zeros_like(fallback_tensor)
-# =======
-#     if len(tensor_list) > 0:
-#         reference_tensor: torch.Tensor = tensor_list[0]
-#     else:
-#         reference_tensor = torch.zeros(0)
-
-#     for tensor in tensor_list:
-#         if tensor.numel() > 0:
-#             valid_tensors.append(tensor)
-
-#     if len(valid_tensors) == 0:
-#         return torch.zeros_like(reference_tensor)
-# >>>>>>> main
-
-    cat_tensor = torch.sum(torch.stack(valid_tensors, dim=0), dim=0)
-    return cat_tensor
-
-
-@get_torch_jit_decorator()
-def cat_sum_horizon_reacher(tensor_list: List[torch.Tensor]):
-    valid_tensors: List[torch.Tensor] = []
-# <<<<<<< aciui4-codex/update-yaml-file-loaders-for-utf-8-encoding
     reference_tensor: Optional[torch.Tensor] = None
     fallback_tensor: Optional[torch.Tensor] = None
 
@@ -620,26 +604,48 @@ def cat_sum_horizon_reacher(tensor_list: List[torch.Tensor]):
         ):
             valid_tensors.append(tensor)
 
-    if reference_tensor is None:
+    if len(valid_tensors) == 0:
         if fallback_tensor is None:
             return torch.tensor(0.0)
         if fallback_tensor.dim() == 0:
-            return torch.zeros_like(fallback_tensor)
+            return torch.zeros((), device=fallback_tensor.device, dtype=fallback_tensor.dtype)
+        return torch.zeros_like(fallback_tensor)
+
+    cat_tensor = torch.sum(torch.stack(valid_tensors, dim=0), dim=0)
+    return cat_tensor
+
+
+@get_torch_jit_decorator()
+def cat_sum_horizon_reacher(tensor_list: List[torch.Tensor]):
+    valid_tensors: List[torch.Tensor] = []
+    reference_tensor: Optional[torch.Tensor] = None
+    fallback_tensor: Optional[torch.Tensor] = None
+
+    for tensor in tensor_list:
+        if fallback_tensor is None:
+            fallback_tensor = tensor
+
+        if tensor.numel() == 0 or tensor.dim() == 0:
+            continue
+
+        if reference_tensor is None:
+            reference_tensor = tensor
+
+        if (
+            reference_tensor is not None
+            and tensor.shape == reference_tensor.shape
+            and tensor.dtype == reference_tensor.dtype
+            and tensor.device == reference_tensor.device
+        ):
+            valid_tensors.append(tensor)
+
+    if len(valid_tensors) == 0:
+        if fallback_tensor is None:
+            return torch.tensor(0.0)
+        if fallback_tensor.dim() == 0:
+            return torch.zeros((), device=fallback_tensor.device, dtype=fallback_tensor.dtype)
         zero_tensor = torch.zeros_like(fallback_tensor)
         return torch.sum(zero_tensor, dim=-1)
-# =======
-#     if len(tensor_list) > 0:
-#         reference_tensor: torch.Tensor = tensor_list[0]
-#     else:
-#         reference_tensor = torch.zeros(0)
-
-#     for tensor in tensor_list:
-#         if tensor.numel() > 0:
-#             valid_tensors.append(tensor)
-
-#     if len(valid_tensors) == 0:
-#         return torch.zeros_like(reference_tensor)
-# >>>>>>> main
 
     cat_tensor = torch.sum(torch.stack(valid_tensors, dim=0), dim=(0, -1))
     return cat_tensor
